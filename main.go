@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -15,6 +17,10 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/joho/godotenv"
 	"golang.org/x/crypto/bcrypt"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 func init() {
@@ -55,9 +61,16 @@ func generateSecret(size int) []byte {
 func main() {
   h := os.Getenv("host")
   p := os.Getenv("port")
+  dbConnURL := os.Getenv("mongo_url")
   hp := net.JoinHostPort(h, p)
 
-  db := InitWrapperDB(TokensMap{})
+  db := InitWrapperDB(dbConnURL)
+  defer func() {
+    if err := db.Client.Disconnect(context.TODO()); err != nil {
+      log.Panic(err)
+    }
+  }()
+
   api := InitWrapperAPI(db)
   g := setupGinRouter(api)
 
@@ -88,31 +101,50 @@ type WrapperAPI struct {
 }
 
 type DBI interface {
-  UploadRefreshToken(*jwt.Token, []byte, string) error
-  CheckRefreshToken(*jwt.Token, *jwt.Token, string) error
-  DeleteRefreshToken(string) error
+  FindIfContains(string) bool
+  InsertRefreshTokenHash(string, []byte) error
+  GetRefreshTokenHash(string) ([]byte, error)
+  DeleteRefreshTokenHash(string) error
 }
-
-type TokensMap map[string][]byte
 
 type WrapperDB struct {
-  Tokens TokensMap
+  Client *mongo.Client
 }
 
-func InitWrapperDB(db TokensMap) *WrapperDB {
-  return &WrapperDB{db}
+var ErrEmptyConnectionString = errors.New("received an empty database connection string")
+func InitWrapperDB(connURL string) *WrapperDB {
+  if connURL == "" {
+    log.Fatal(ErrEmptyConnectionString)
+  }
+
+  serverAPI := options.ServerAPI(options.ServerAPIVersion1)
+  opts := options.Client().ApplyURI(connURL).SetServerAPIOptions(serverAPI)
+  client, err := mongo.Connect(context.TODO(), opts)
+  if err != nil {
+    log.Panic(err)
+  }
+  
+  if err := client.Database("admin").RunCommand(context.TODO(), bson.D{{"ping", 1}}).Err(); err != nil {
+    log.Panic(err)
+  }
+  fmt.Println("Successfully connected to mongodb")
+  
+  wrap := &WrapperDB{client}
+
+  return wrap
 }
+
 
 
 var ErrTokenOccupied = errors.New("Token for this GUID already exists;")
-func (wdb *WrapperDB) UploadRefreshToken(refreshToken *jwt.Token, refSign []byte, guid string) error {
+func (wr *WrapperAPI) UploadRefreshToken(refreshToken *jwt.Token, refSign []byte, guid string) error {
   unID, err := produceUniqueID(refreshToken, guid)
   if err != nil {
     return err
   }
 
-  _, ok := wdb.Tokens[unID]
-  if ok {
+  alreadyThere := wr.DB.FindIfContains(unID)
+  if alreadyThere {
     return ErrTokenOccupied
   }
 
@@ -121,10 +153,44 @@ func (wdb *WrapperDB) UploadRefreshToken(refreshToken *jwt.Token, refSign []byte
     return err
   }
   
-  wdb.Tokens[unID] = crypted
-  defer wdb.scheduleDeletingToken(unID, REFRESH_TOKEN_LIFETIME)
+  err = wr.DB.InsertRefreshTokenHash(unID, crypted)
+  if err != nil {
+    return err
+  }
+
+  defer wr.scheduleDeletingToken(unID, REFRESH_TOKEN_LIFETIME)
   return nil
 }
+
+
+func (wdb *WrapperDB) getRefreshesColl() *mongo.Collection {
+  return wdb.Client.Database(MEDODS_DB_NAME).Collection(REFRESH_TOKENS_COLLECTION)
+}
+
+const MEDODS_DB_NAME = "medods"
+const REFRESH_TOKENS_COLLECTION = "refreshes"
+type RefreshTokenModel struct {
+  UNID string
+  BcryptHash []byte
+}
+
+func (wdb *WrapperDB) FindIfContains(tokenUNID string) bool {
+  coll := wdb.getRefreshesColl()
+  refToken := RefreshTokenModel{}
+  filter := bson.D{{"unid", tokenUNID}}
+  err := coll.FindOne(context.TODO(), filter).Decode(&refToken)
+  return err == nil
+}
+
+func (wdb *WrapperDB) InsertRefreshTokenHash(UNID string, bcryptHash []byte) error {
+  coll := wdb.getRefreshesColl()
+  newTokenHash := RefreshTokenModel{UNID, bcryptHash}
+  res, err := coll.InsertOne(context.TODO(), newTokenHash)
+  fmt.Println(res, err)
+  
+  return err
+}
+
 
 func produceUniqueID(refreshToken *jwt.Token, guid string) (string, error) {
   t, err := refreshToken.Claims.GetIssuedAt()
@@ -134,47 +200,28 @@ func produceUniqueID(refreshToken *jwt.Token, guid string) (string, error) {
   return fmt.Sprintf("%d -- %v", t.UnixMicro(), guid), nil
 }
 
-func (wdb *WrapperDB) scheduleDeletingToken(unidKey string, duration time.Duration) {
+func (wr *WrapperAPI) scheduleDeletingToken(unidKey string, duration time.Duration) {
   go func() {
     time.Sleep(duration)
-    wdb.DeleteRefreshToken(unidKey)
+    wr.DB.DeleteRefreshTokenHash(unidKey)
   }()
 }
 
 
-func (wdb *WrapperDB) DeleteRefreshToken(unid string) error {
-  delete(wdb.Tokens, unid)
-  return nil
+func (wdb *WrapperDB) DeleteRefreshTokenHash(unid string) error {
+  coll := wdb.getRefreshesColl()
+  filter := bson.D{{"unid", unid}}
+  _, err := coll.DeleteOne(context.TODO(), filter)
+  return err
 }
 
-func (wdb *WrapperDB) CheckRefreshToken(refToken *jwt.Token, accToken *jwt.Token, guid string) error {
-  reffedAccessSignature, err := refToken.Claims.GetSubject()
-  if err != nil {
-    return ErrTokenInvalid
-  }
+func (wdb *WrapperDB) GetRefreshTokenHash(unid string) ([]byte, error) {
+  coll := wdb.getRefreshesColl()
+  tokenModel := RefreshTokenModel{}
+  filter := bson.D{{"unid", unid}}
+  err := coll.FindOne(context.TODO(), filter).Decode(&tokenModel)
 
-  if reffedAccessSignature != takeSignature(accToken.Raw) {
-    return ErrTokenInvalid
-  }
-
-  unid, err := produceUniqueID(refToken, guid)
-  if err != nil {
-    return err
-  }
-
-  rightHash, ok := wdb.Tokens[unid]
-  if !ok {
-    return ErrTokenInvalid
-  }
-
-  sign := takeSignature(refToken.Raw)
-  refToken.Claims.GetSubject()
-  err = bcrypt.CompareHashAndPassword(rightHash, []byte(sign))
-  if err != nil {
-    return ErrTokenInvalid
-  }
-
-  return nil
+  return tokenModel.BcryptHash, err
 }
 
 
@@ -275,8 +322,8 @@ func (wr *WrapperAPI) forgeAuthPair(guid string) (*AuthTokenPair, error) {
   pair.Refresh = refTokenSigned
 
   refSignature := takeSignature(refTokenSigned)
-  err = wr.DB.UploadRefreshToken(refToken, []byte(refSignature), guid)
-  return pair, nil
+  err = wr.UploadRefreshToken(refToken, []byte(refSignature), guid)
+  return pair, err
 }
 
 func takeSignature(jwtStr string) string {
@@ -346,14 +393,19 @@ func (wr *WrapperAPI) RefreshAuthTokens(c *gin.Context) {
     return
   }
 
-  err = wr.DB.CheckRefreshToken(refToken, accToken, guid)
+  unid, err := produceUniqueID(refToken, guid)
   if err != nil {
     c.AbortWithError(http.StatusUnauthorized, err)
     return
   }
-  unid, err := produceUniqueID(refToken, guid)
 
-  err = wr.DB.DeleteRefreshToken(unid)
+  err = wr.verifyRefreshToken(refToken, accToken, unid)
+  if err != nil {
+    c.AbortWithError(http.StatusUnauthorized, err)
+    return
+  }
+  
+  err = wr.DB.DeleteRefreshTokenHash(unid)
   if err != nil {
     c.AbortWithError(http.StatusInternalServerError, err)
     return
@@ -366,6 +418,29 @@ func (wr *WrapperAPI) RefreshAuthTokens(c *gin.Context) {
   }
 
   sendBackTokenPair(c, pair)
+}
+
+func (wr *WrapperAPI) verifyRefreshToken(refToken *jwt.Token, accToken *jwt.Token, unid string) error {
+  reffedAccessSignature, err := refToken.Claims.GetSubject()
+  if err != nil {
+    return ErrTokenInvalid
+  }
+
+  if reffedAccessSignature != takeSignature(accToken.Raw) {
+    return ErrTokenInvalid
+  }
+
+  rightHash, err := wr.DB.GetRefreshTokenHash(unid)
+  if err != nil {
+    return ErrTokenInvalid
+  }
+
+  sign := takeSignature(refToken.Raw)
+  err = bcrypt.CompareHashAndPassword(rightHash, []byte(sign))
+  if err != nil {
+    return ErrTokenInvalid
+  }
+  return nil
 }
 
 
